@@ -28,7 +28,8 @@ Reducer::Reducer(
     std::vector<std::vector<size_t>> bucket_indices,
     std::shared_ptr<c10d::ProcessGroup> process_group,
     std::vector<std::vector<bool>> expect_sparse_gradients,
-    int64_t bucket_bytes_cap)
+    int64_t bucket_bytes_cap,
+    bool find_unused_parameters)
     : replicas_(std::move(replicas)),
       process_group_(std::move(process_group)),
       expect_sparse_gradients_(std::move(expect_sparse_gradients)),
@@ -36,6 +37,7 @@ Reducer::Reducer(
       require_finalize_(false),
       next_bucket_(0),
       has_marked_unused_parameters_(false),
+      find_unused_parameters_(find_unused_parameters),
       local_used_maps_reduced_(false),
       backward_stats_base_(0),
       has_rebuilt_bucket_(false),
@@ -132,7 +134,6 @@ Reducer::Reducer(
     const auto replica_count = replicas_.size();
     const auto variable_count = replicas_[0].size();
     local_used_maps_.resize(replica_count);
-    local_used_maps_dev_.resize(replica_count);
 
     for (size_t i = 0; i < replica_count; i++) {
       at::TensorOptions options;
@@ -147,12 +148,15 @@ Reducer::Reducer(
             at::zeros({static_cast<long>(variable_count)}, options);
       }
 
-      // This tensor needs to be on the same device as replica because backend
-      // such as NCCL may not support CPU tensors, and hence it might not work
-      // if we always put it on CPU.
-      options = options.device(replicas_[i][0].device());
-      local_used_maps_dev_[i] =
-          at::empty({static_cast<long>(variable_count)}, options);
+      if (find_unused_parameters_) {
+        local_used_maps_dev_.resize(replica_count);
+        // This tensor needs to be on the same device as replica because backend
+        // such as NCCL may not support CPU tensors, and hence it might not work
+        // if we always put it on CPU.
+        options = options.device(replicas_[i][0].device());
+        local_used_maps_dev_[i] =
+            at::empty({static_cast<long>(variable_count)}, options);
+      }
     }
   }
 }
@@ -475,13 +479,15 @@ void Reducer::mark_variable_ready(VariableIndex index) {
   // Run finalizer function and kick off reduction for local_used_maps once the
   // final bucket was marked ready.
   if (next_bucket_ == buckets_.size()) {
-    // H2D from local_used_maps_ to local_used_maps_dev_
-    for (size_t i = 0; i < local_used_maps_.size(); i++) {
-      // We do async H2D to avoid the blocking overhead. The async copy and
-      // allreduce respect the current stream, so will be sequenced correctly.
-      local_used_maps_dev_[i].copy_(local_used_maps_[i], true);
+    if (find_unused_parameters_) {
+      // H2D from local_used_maps_ to local_used_maps_dev_
+      for (size_t i = 0; i < local_used_maps_.size(); i++) {
+        // We do async H2D to avoid the blocking overhead. The async copy and
+        // allreduce respect the current stream, so will be sequenced correctly.
+        local_used_maps_dev_[i].copy_(local_used_maps_[i], true);
+      }
+      local_used_work_ = process_group_->allreduce(local_used_maps_dev_);
     }
-    local_used_work_ = process_group_->allreduce(local_used_maps_dev_);
 
     torch::autograd::Engine::get_default_engine().queue_callback([=] {
       std::unique_lock<std::mutex> lock(this->mutex_);
@@ -823,7 +829,8 @@ void Reducer::finalize_bucket_dense(Bucket& bucket) {
       // local_used_maps_reduced_ is true.
       bool global_unused =
           local_used_maps_[replica_index][variable_index].item<int>() == 0;
-      if (global_unused && !local_used_maps_reduced_) {
+      if (global_unused && !local_used_maps_reduced_ &&
+          find_unused_parameters_) {
         // Wait for local_used_maps reduction to complete.
         local_used_work_->wait();
         // D2H from local_used_maps_dev_ to local_used_maps_
@@ -884,16 +891,18 @@ void Reducer::finalize_backward() {
   for (auto& local_used : local_used_maps_) {
     local_used.fill_(0);
   }
-  // Due to the lazy wait, it is possible that reduction of the current
-  // iteration is still going when the one for next iteration gets kicked off.
-  // For such case, we want to wait explicitly to make sure the reduction does
-  // complete before kicking off next one. Otherwise the previous one may
-  // interfere, write to the device-side memory and clobber the content of
-  // local_unused_maps_dev_.
-  if (!local_used_maps_reduced_) {
-    local_used_work_->wait();
+  if (find_unused_parameters_) {
+    // Due to the lazy wait, it is possible that reduction of the current
+    // iteration is still going when the one for next iteration gets kicked off.
+    // For such case, we want to wait explicitly to make sure the reduction does
+    // complete before kicking off next one. Otherwise the previous one may
+    // interfere, write to the device-side memory and clobber the content of
+    // local_unused_maps_dev_.
+    if (!local_used_maps_reduced_) {
+      local_used_work_->wait();
+    }
+    local_used_maps_reduced_ = false;
   }
-  local_used_maps_reduced_ = false;
 }
 
 void Reducer::runGradCallbackForVariable(
